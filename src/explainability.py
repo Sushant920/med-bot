@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.utils import load_model, load_metadata
+from src.utils import load_model, load_metadata, get_data_path
 
 
 class SHAPExplainer:
@@ -42,7 +42,8 @@ class SHAPExplainer:
         
         # Load feature manifest (priority)
         try:
-            with open("colabupload/feature_manifest.json", "r") as f:
+            manifest_path = get_data_path("feature_manifest.json")
+            with open(manifest_path, "r") as f:
                 data = json.load(f)
                 self.feature_names = data.get("features", [])
         except:
@@ -105,7 +106,7 @@ class SHAPExplainer:
         Compute SHAP values for given data
         
         Args:
-            X: Input features
+            X: Input features (may include leakage features that will be dropped)
             
         Returns:
             SHAP Explanation object
@@ -114,8 +115,86 @@ class SHAPExplainer:
             raise ValueError("Explainer not initialized. Call create_explainer() first.")
         
         print(f"Computing SHAP values for {len(X)} samples...")
-        shap_values = self.explainer(X)
-        print("✓ SHAP values computed")
+        
+        # The model was trained WITHOUT leakage features, so we need to drop them
+        # before passing to SHAP (same as we do for predictions)
+        leakage = ['weak_score', 'high_risk_drug', 'faers_adr_rate', 'faers_severe_rate']
+        X_clean = X.drop(columns=[c for c in leakage if c in X.columns], errors='ignore')
+        
+        # Ensure feature alignment with model
+        # Get expected feature count from model
+        try:
+            # Try to get feature count from model
+            if hasattr(self.model, 'num_features'):
+                expected_feature_count = self.model.num_features()
+            elif hasattr(self.model, 'get_score'):
+                # Get feature count from importance scores
+                importance = self.model.get_score(importance_type='gain')
+                expected_feature_count = len(importance)
+            else:
+                expected_feature_count = None
+        except Exception:
+            expected_feature_count = None
+        
+        # Check if feature count matches after dropping leakage
+        if expected_feature_count is not None and len(X_clean.columns) != expected_feature_count:
+            print(f"Warning: Feature count mismatch. Expected: {expected_feature_count}, Got: {len(X_clean.columns)}")
+            
+            # Try to use feature_names if available (these should be the clean features)
+            if self.feature_names and len(self.feature_names) == expected_feature_count:
+                # Create aligned DataFrame using feature_names
+                X_aligned = pd.DataFrame(index=X_clean.index)
+                for feat in self.feature_names:
+                    if feat in X_clean.columns:
+                        X_aligned[feat] = X_clean[feat]
+                    else:
+                        # Add missing feature with zeros
+                        X_aligned[feat] = 0
+                        print(f"  Adding missing feature '{feat}' with zeros")
+                X_clean = X_aligned
+            else:
+                # If we still have a mismatch, try to infer from model importance
+                try:
+                    importance = self.model.get_score(importance_type='gain')
+                    # XGBoost uses f0, f1, f2... format, map to column indices
+                    if importance and list(importance.keys())[0].startswith('f'):
+                        # Model uses positional features, just ensure count matches
+                        if len(X_clean.columns) > expected_feature_count:
+                            # Drop extra columns (keep first N)
+                            X_clean = X_clean.iloc[:, :expected_feature_count]
+                        elif len(X_clean.columns) < expected_feature_count:
+                            # Add missing columns with zeros
+                            missing = expected_feature_count - len(X_clean.columns)
+                            for i in range(missing):
+                                X_clean[f'missing_feature_{i}'] = 0
+                except Exception:
+                    pass
+                
+                # Final check
+                if len(X_clean.columns) != expected_feature_count:
+                    raise ValueError(
+                        f"Feature count mismatch: Model expects {expected_feature_count} features, "
+                        f"but received {len(X_clean.columns)} after dropping leakage. "
+                        f"Original had {len(X.columns)} features. "
+                        f"Please ensure X contains all features the model was trained on (excluding leakage)."
+                    )
+        
+        # Use the cleaned DataFrame
+        X = X_clean
+        
+        try:
+            shap_values = self.explainer(X)
+            print("✓ SHAP values computed")
+        except Exception as e:
+            # If still fails, provide more detailed error
+            error_msg = f"Error computing SHAP: {e}\n"
+            error_msg += f"X shape: {X.shape}, columns: {len(X.columns)}\n"
+            if expected_feature_count:
+                error_msg += f"Expected feature count: {expected_feature_count}\n"
+            if self.feature_names:
+                error_msg += f"Feature names available: {len(self.feature_names)}\n"
+            print(error_msg)
+            raise ValueError(error_msg) from e
         
         return shap_values
     
@@ -145,10 +224,17 @@ class SHAPExplainer:
         mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
         
         # Create DataFrame
-        if len(self.feature_names) == len(mean_abs_shap):
+        # X has been cleaned (leakage removed) in compute_shap_values
+        leakage = ['weak_score', 'high_risk_drug', 'faers_adr_rate', 'faers_severe_rate']
+        X_clean = X.drop(columns=[c for c in leakage if c in X.columns], errors='ignore')
+        
+        if self.feature_names and len(self.feature_names) == len(mean_abs_shap):
             feature_names = self.feature_names
+        elif len(X_clean.columns) == len(mean_abs_shap):
+            feature_names = X_clean.columns.tolist()
         else:
-            feature_names = X.columns.tolist()
+            # Fallback to generic names
+            feature_names = [f'feature_{i}' for i in range(len(mean_abs_shap))]
         
         importance_df = pd.DataFrame({
             'feature': feature_names,
@@ -207,7 +293,7 @@ class SHAPExplainer:
         Get local explanation for single prediction
         
         Args:
-            X_single: Single patient features (1 row DataFrame)
+            X_single: Single patient features (1 row DataFrame) - may include leakage features
             top_n: Number of top contributors to return
             
         Returns:
@@ -216,14 +302,22 @@ class SHAPExplainer:
         if len(X_single) != 1:
             raise ValueError("X_single must contain exactly 1 sample")
         
-        # Compute SHAP values
+        # Compute SHAP values (this will drop leakage features internally)
         shap_values = self.compute_shap_values(X_single)
         
-        # Get feature names
-        if self.feature_names:
+        # Get feature names - use the cleaned features (after leakage removal)
+        # The compute_shap_values method returns values for cleaned features
+        leakage = ['weak_score', 'high_risk_drug', 'faers_adr_rate', 'faers_severe_rate']
+        X_clean = X_single.drop(columns=[c for c in leakage if c in X_single.columns], errors='ignore')
+        
+        if self.feature_names and len(self.feature_names) == len(shap_values.values[0]):
             feature_names = self.feature_names
         else:
-            feature_names = X_single.columns.tolist()
+            # Use column names from cleaned DataFrame
+            feature_names = X_clean.columns.tolist()
+            # If still mismatch, use indices
+            if len(feature_names) != len(shap_values.values[0]):
+                feature_names = [f'feature_{i}' for i in range(len(shap_values.values[0]))]
         
         # Create list of (feature, shap_value) tuples
         shap_contributions = list(zip(feature_names, shap_values.values[0]))
@@ -280,22 +374,29 @@ class SHAPExplainer:
         Complete explanation for single prediction
         
         Args:
-            X_single: Single patient features
+            X_single: Single patient features (should include ALL features model was trained on)
             return_plot: Whether to generate plot
             
         Returns:
             Dictionary with explanation details
         """
-        # Get prediction
-        # Fix: Use DMatrix for Booster and remove leakage
+        # Ensure X_single has all features the model expects
+        # The model was trained with all features (including leakage), so SHAP needs all features too
+        # But for prediction, we remove leakage features
+        
+        # Get prediction (remove leakage for actual prediction)
         leakage = ['weak_score', 'high_risk_drug', 'faers_adr_rate', 'faers_severe_rate']
         X_safe = X_single.drop(columns=[c for c in leakage if c in X_single.columns], errors='ignore')
         
         dtest = xgb.DMatrix(X_safe)
         pred_proba = self.model.predict(dtest)[0]
         
-        # Get SHAP explanation
-        top_contributors, shap_values = self.get_local_explanation(X_single, top_n=10)
+        # For SHAP, use X_single with ALL features (model expects all features for SHAP)
+        # But ensure feature alignment first
+        X_for_shap = X_single.copy()
+        
+        # Get SHAP explanation (with all features)
+        top_contributors, shap_values = self.get_local_explanation(X_for_shap, top_n=10)
         
         # Format contributors
         contributors_formatted = []
@@ -382,7 +483,8 @@ def main():
     
     # Load test data for background
     try:
-        X_test = pd.read_csv("data/output/X_features.csv")
+        x_path = get_data_path("X_features.csv")
+        X_test = pd.read_csv(x_path)
         print(f"✓ Loaded {len(X_test)} samples for background data")
         
         # Use subset for background

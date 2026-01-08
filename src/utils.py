@@ -8,6 +8,32 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 import joblib
+from pathlib import Path
+
+def get_project_root() -> Path:
+    """Returns the project root directory."""
+    return Path(__file__).parent.parent
+
+def get_data_path(filename: str) -> Path:
+    """
+    Robustly find data files.
+    Checks multiple common locations relative to project root.
+    """
+    root = get_project_root()
+    possible_paths = [
+        root / "colabupload" / filename,
+        root / "data" / "output" / filename,
+        root / "models" / filename,
+        root / "reports" / filename,
+        root / filename
+    ]
+    
+    for path in possible_paths:
+        if path.exists():
+            return path
+            
+    # Fallback return constructed path in colabupload even if missing (for write ops)
+    return root / "colabupload" / filename
 
 
 def get_risk_category(risk_score: float) -> str:

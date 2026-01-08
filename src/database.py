@@ -5,10 +5,28 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, F
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
-# Define database file path
+import streamlit as st
+
+# Define database file path (Local Fallback)
 DB_FOLDER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_FILE = os.path.join(DB_FOLDER, "medbot_users.db")
 DATABASE_URL = f"sqlite:///{DB_FILE}"
+
+# Check for Cloud Database Connection in Secrets
+try:
+    if "DATABASE_URL" in st.secrets:
+        DATABASE_URL = st.secrets["DATABASE_URL"]
+    elif "database" in st.secrets and "url" in st.secrets["database"]:
+        DATABASE_URL = st.secrets["database"]["url"]
+except FileNotFoundError:
+    pass # No secrets file found (running locally without .streamlit/secrets.toml)
+except Exception:
+    pass # Other secrets errors, fall back to SQLite
+
+# Handle Postgres definition for SQLAlchemy (postgres:// -> postgresql://)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 
 Base = declarative_base()
 
@@ -44,7 +62,13 @@ class PatientRecord(Base):
     user = relationship("User", back_populates="records")
 
 # Database setup
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# Database setup
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+else:
+    connect_args = {}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():

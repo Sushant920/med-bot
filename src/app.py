@@ -19,7 +19,8 @@ import xgboost as xgb
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.utils import (
     load_model, get_risk_category, get_risk_color, 
-    create_prediction_summary, generate_report_filename, parse_fhir_patient
+    create_prediction_summary, generate_report_filename, parse_fhir_patient,
+    get_data_path, get_project_root
 )
 from src.explainability import SHAPExplainer
 from src.evaluate import ModelEvaluator
@@ -110,10 +111,8 @@ st.markdown("""
         background-color: #FFFFFF !important;
     }
     
-    /* Sidebar styling - hidden for landing page */
-    [data-testid="stSidebar"] {
-        display: none !important;
-    }
+    /* Sidebar styling - hidden for landing page only */
+    /* Note: Sidebar visibility is controlled by JavaScript for dashboard pages */
     
     [data-testid="stSidebar"] .element-container {
         color: #1F2937;
@@ -681,21 +680,23 @@ def load_model_and_explainer():
         return None, None
 
 
+
+
+
 @st.cache_data
-def load_drug_list():
-    """Load available drugs from FAERS data"""
+def load_drug_options():
+    """Load unique drug names for autocomplete"""
     try:
-        # Fix: Use correct path
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        faers_path = os.path.join(base_dir, "colabupload", "faers_drug_summary.csv")
-        faers = pd.read_csv(faers_path)
-        drugs = sorted(faers['drugname'].dropna().unique().tolist())
-        return drugs
-    except:
-        return ["Aspirin", "Metformin", "Lisinopril", "Atorvastatin", "Levothyroxine"]
+        faers_path = get_data_path("faers_drug_summary.csv")
+        if faers_path.exists():
+            df = pd.read_csv(faers_path)
+            # Sort alphabetically and handle non-strings
+            drugs = sorted([str(d) for d in df['drugname'].unique() if pd.notna(d)])
+            return ["Select a drug..."] + drugs + ["Other"]
+        return ["Other"]
+    except Exception:
+        return ["Other"]
 
-
-@st.cache_data
 def load_encoders_map():
     """Load and invert encoders.json for mapping UI strings to Model integers"""
     try:
@@ -728,7 +729,8 @@ def normalize_drug_name(name):
 def load_performance_metrics():
     """Load model performance metrics"""
     try:
-        metrics = pd.read_csv("reports/evaluation_metrics.csv")
+        metrics_path = get_data_path("evaluation_metrics.csv")
+        metrics = pd.read_csv(metrics_path)
         return metrics.to_dict('records')[0]
     except:
         # Default metrics (realistic values after class balancing)
@@ -806,7 +808,8 @@ def page_patient_entry():
     st.markdown("""
     <style>
     /* Force specific styling for buttons in this view */
-    div[data-testid="stHorizontalBlock"] button[kind="primary"] {
+    /* Force specific styling for buttons in this view */
+    button[kind="primary"] {
         background-color: #111827 !important;
         color: #FFFFFF !important;
         border-radius: 999px !important;
@@ -814,10 +817,11 @@ def page_patient_entry():
         border: none !important;
         box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08) !important;
     }
-    div[data-testid="stHorizontalBlock"] button[kind="primary"]:hover {
+    button[kind="primary"]:hover {
         background-color: #030712 !important;
         box-shadow: 0 14px 28px rgba(15, 23, 42, 0.16) !important;
         transform: translateY(-1px);
+        color: #FFFFFF !important;
     }
     div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
         background-color: #FFFFFF !important;
@@ -922,10 +926,10 @@ def calculate_drug_risk_features(selected_drugs):
             'num_high_risk_drugs': 0
         }
     
+    # Load FAERS drug data
     try:
-        # Load FAERS drug data
-        # Fix: Use correct path 'colabupload' instead of 'data/output'
-        faers_data = pd.read_csv("colabupload/faers_drug_summary.csv")
+        faers_path = get_data_path("faers_drug_summary.csv")
+        faers_data = pd.read_csv(faers_path)
         
         # Get drug risk data for selected drugs
         drug_rates = []
@@ -976,8 +980,8 @@ def analyze_drug_risks(selected_drugs):
         return {'top_drugs': [], 'high_risk_count': 0, 'mean_adr_rate': 0, 'max_severe_rate': 0}
     
     try:
-        # Fix: Use correct path
-        faers_data = pd.read_csv("colabupload/faers_drug_summary.csv")
+        faers_path = get_data_path("faers_drug_summary.csv")
+        faers_data = pd.read_csv(faers_path)
         
         drug_info = []
         for drug in selected_drugs:
@@ -1177,11 +1181,20 @@ def page_prediction_results():
     # Prepare features for model
     try:
         # Load feature template
-        X_template = pd.read_csv("models/feature_template.csv").iloc[0:1].copy()
+        template_path = get_data_path("feature_template.csv")
+        template_df = pd.read_csv(template_path)
+        column_names = template_df.columns.tolist()
+        
+        # If the template has data rows, use the first one
+        if len(template_df) > 0 and not template_df.iloc[0:1].isna().all().all():
+            X_template = template_df.iloc[0:1].copy()
+        else:
+            # Create a new DataFrame with one row of zeros based on column names
+            X_template = pd.DataFrame({col: [0] for col in column_names})
         
         # Clear existing values to ensure fresh data
         for col in X_template.columns:
-            X_template[col] = 0
+            X_template[col] = pd.to_numeric(X_template[col], errors='coerce').fillna(0)
         
         gender_val = 1 if str(patient_data.get('gender', 'M')).upper().startswith('M') else 0
         selected_drugs = patient_data.get('selected_drugs', [])
@@ -1480,7 +1493,8 @@ def page_prediction_results():
             # Correct way to get importance from Booster
             importance_map = model.get_score(importance_type='gain')
             # Map valid features, default to 0
-            feature_names = pd.read_csv("models/feature_template.csv").columns
+            template_path = get_data_path("feature_template.csv")
+            feature_names = pd.read_csv(template_path).columns
             feature_importance = [importance_map.get(f, 0) for f in feature_names]
             
             importance_df = pd.DataFrame({
@@ -1627,7 +1641,8 @@ def page_explainability():
         st.subheader("Global Feature Importance")
         try:
             # Load feature importance
-            feature_names = pd.read_csv("models/feature_template.csv").columns
+            template_path = get_data_path("feature_template.csv")
+            feature_names = pd.read_csv(template_path).columns
             # Correct way to get importance from Booster
             importance_map = model.get_score(importance_type='gain')
             feature_importance = [importance_map.get(f, 0) for f in feature_names]
@@ -1659,9 +1674,19 @@ def page_explainability():
             try:
                 patient_data = st.session_state['patient_data']
                 # Prepare features (same as in prediction)
-                X_template = pd.read_csv("models/feature_template.csv").iloc[0:1].copy()
+                template_path = get_data_path("feature_template.csv")
+                template_df = pd.read_csv(template_path)
+                column_names = template_df.columns.tolist()
+                
+                # If the template has data rows, use the first one
+                if len(template_df) > 0 and not template_df.iloc[0:1].isna().all().all():
+                    X_template = template_df.iloc[0:1].copy()
+                else:
+                    # Create a new DataFrame with one row of zeros based on column names
+                    X_template = pd.DataFrame({col: [0] for col in column_names})
+                
                 for col in X_template.columns:
-                    X_template[col] = 0
+                    X_template[col] = pd.to_numeric(X_template[col], errors='coerce').fillna(0)
                 
                 feature_mapping = {
                     'gender': 1 if patient_data.get('gender') == 'M' else 0,
@@ -1819,7 +1844,8 @@ def page_performance():
     
     # Define feature_names centrally before any try/except blocks
     try:
-        feature_names = pd.read_csv("models/feature_template.csv").columns.tolist()
+        template_path = get_data_path("feature_template.csv")
+        feature_names = pd.read_csv(template_path).columns.tolist()
     except:
         feature_names = []
     
@@ -1895,6 +1921,76 @@ def page_workflow():
 
 def render_dashboard_header():
     """Render dashboard navbar with logo and title"""
+    # Add sidebar toggle button and ensure it's always accessible
+    st.markdown("""
+        <style>
+            /* Make Streamlit's built-in sidebar toggle button always visible */
+            button[data-testid="baseButton-header"][aria-label*="sidebar"],
+            button[data-testid="baseButton-header"][aria-label*="menu"],
+            [data-testid="stHeader"] button[aria-label*="sidebar"],
+            [data-testid="stHeader"] button[aria-label*="menu"] {
+                display: block !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+                z-index: 999 !important;
+            }
+            
+            /* Custom toggle button styling */
+            .sidebar-toggle-btn {
+                position: fixed;
+                top: 1rem;
+                left: 1rem;
+                z-index: 1000;
+                background-color: #2563EB;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0.5rem 1rem;
+                cursor: pointer;
+                font-size: 1.2rem;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }
+            
+            .sidebar-toggle-btn:hover {
+                background-color: #1E40AF;
+            }
+        </style>
+        <button class="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle Sidebar">☰ Menu</button>
+        <script>
+            function toggleSidebar() {
+                // Try to click Streamlit's built-in sidebar toggle button
+                const toggleBtn = document.querySelector('button[data-testid="baseButton-header"][aria-label*="sidebar"]') ||
+                                  document.querySelector('button[data-testid="baseButton-header"][aria-label*="menu"]') ||
+                                  document.querySelector('[data-testid="stHeader"] button[aria-label*="sidebar"]') ||
+                                  document.querySelector('[data-testid="stHeader"] button[aria-label*="menu"]');
+                
+                if (toggleBtn) {
+                    toggleBtn.click();
+                } else {
+                    // Fallback: manually toggle sidebar visibility
+                    const sidebar = document.querySelector('[data-testid="stSidebar"]');
+                    if (sidebar) {
+                        const isVisible = sidebar.style.display !== 'none';
+                        sidebar.style.display = isVisible ? 'none' : 'block';
+                    }
+                }
+            }
+            
+            // Ensure sidebar toggle button is always visible
+            window.addEventListener('load', function() {
+                const toggleBtn = document.querySelector('button[data-testid="baseButton-header"][aria-label*="sidebar"]') ||
+                                  document.querySelector('button[data-testid="baseButton-header"][aria-label*="menu"]');
+                if (toggleBtn) {
+                    toggleBtn.style.display = 'block';
+                    toggleBtn.style.visibility = 'visible';
+                    toggleBtn.style.opacity = '1';
+                }
+            });
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+    
     st.markdown(
         """
         <div class="app-header-row">
@@ -2094,7 +2190,8 @@ def process_uploaded_patient_data(patient_data):
     
     try:
         # Prepare features for model
-        cols = pd.read_csv("models/feature_template.csv").columns
+        template_path = get_data_path("feature_template.csv")
+        cols = pd.read_csv(template_path).columns
         X_template = pd.DataFrame({c: [0] for c in cols})
         
         # Calculate derived clinical flags (replicating preprocess.py logic)
@@ -2324,7 +2421,8 @@ def predict_patient_risk_pure(patient_data):
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         model_path = os.path.join(base_dir, "models", "xgb_adr_model.json")
         model = load_model(model_path)
-        cols = pd.read_csv("models/feature_template.csv").columns
+        template_path = get_data_path("feature_template.csv")
+        cols = pd.read_csv(template_path).columns
         X_template = pd.DataFrame({c: [0] for c in cols})
         gender_val = 1 if str(patient_data.get('gender', 'M')).upper().startswith('M') else 0
         selected_drugs = patient_data.get('selected_drugs', [])
@@ -2694,12 +2792,40 @@ def render_patient_form():
             
             with st.form("add_drug_form", clear_on_submit=True):
                 c1, c2 = st.columns(2)
-                d_name = c1.text_input("Generic Name")
+                # Load drug options
+                drug_options = load_drug_options()
+                
+                # Drug Selection with Autocomplete
+                selected_drug = c1.selectbox("Generic Name", options=drug_options, help="Type to search")
+                
+                if selected_drug == "Other":
+                    d_name = c1.text_input("Enter Drug Name Manually")
+                elif selected_drug == "Select a drug...":
+                    d_name = ""
+                else:
+                    d_name = selected_drug
                 d_dose = c2.text_input("Dose (e.g., 500mg)")
                 
                 c3, c4 = st.columns(2)
                 d_route = c3.selectbox("Route", ["PO (Oral)", "IV", "IM", "SC", "Topical"])
                 d_freq = c4.selectbox("Frequency", ["OD", "BD", "TDS", "QID", "HS", "STAT"])
+                
+                # Duration and Start Date
+                c5, c6 = st.columns(2)
+                d_duration = c5.number_input("Duration (days)", min_value=0, max_value=365, value=0, help="Expected treatment duration")
+                d_start_date = c6.date_input("Start Date", value=None, help="Medication start date")
+                
+                # Special Flags
+                st.markdown("**Special Flags:**")
+                flag_cols = st.columns(4)
+                with flag_cols[0]:
+                    d_narrow_ti = st.checkbox("Narrow Therapeutic Index", help="Drugs with narrow therapeutic window")
+                with flag_cols[1]:
+                    d_nephrotoxic = st.checkbox("Nephrotoxic", help="May cause kidney damage")
+                with flag_cols[2]:
+                    d_hepatotoxic = st.checkbox("Hepatotoxic", help="May cause liver damage")
+                with flag_cols[3]:
+                    d_qt_prolonging = st.checkbox("QT-prolonging", help="May prolong QT interval")
                 
                 high_risk = st.checkbox("⚠️ High Risk / Narrow Therapeutic Index")
                 
@@ -2710,6 +2836,12 @@ def render_patient_form():
                             "dose": d_dose,
                             "route": d_route,
                             "freq": d_freq,
+                            "duration_days": d_duration,
+                            "start_date": d_start_date.isoformat() if d_start_date else None,
+                            "narrow_therapeutic_index": d_narrow_ti,
+                            "nephrotoxic": d_nephrotoxic,
+                            "hepatotoxic": d_hepatotoxic,
+                            "qt_prolonging": d_qt_prolonging,
                             "high_risk": high_risk
                         })
                         st.rerun()
@@ -2721,8 +2853,35 @@ def render_patient_form():
                 for idx, med in enumerate(st.session_state['medications_list']):
                     col_txt, col_act = st.columns([5,1])
                     with col_txt:
-                        risk_mark = "⚠️" if med['high_risk'] else "💊"
-                        st.markdown(f"{risk_mark} **{med['name']}** {med['dose']} via {med['route']} ({med['freq']})")
+                        risk_mark = "⚠️" if med.get('high_risk', False) else "💊"
+                        med_info = f"{risk_mark} **{med['name']}** {med.get('dose', '')} via {med.get('route', '')} ({med.get('freq', '')})"
+                        
+                        # Add duration and start date if available
+                        if med.get('duration_days', 0) > 0:
+                            med_info += f" | Duration: {med['duration_days']} days"
+                        if med.get('start_date'):
+                            from datetime import datetime
+                            try:
+                                start_date = datetime.fromisoformat(med['start_date']).strftime('%Y-%m-%d')
+                                med_info += f" | Started: {start_date}"
+                            except:
+                                pass
+                        
+                        # Add special flags
+                        flags = []
+                        if med.get('narrow_therapeutic_index', False):
+                            flags.append("NTI")
+                        if med.get('nephrotoxic', False):
+                            flags.append("Nephro")
+                        if med.get('hepatotoxic', False):
+                            flags.append("Hepato")
+                        if med.get('qt_prolonging', False):
+                            flags.append("QT")
+                        
+                        if flags:
+                            med_info += f" | Flags: {', '.join(flags)}"
+                        
+                        st.markdown(med_info)
                     with col_act:
                         if st.button("❌", key=f"del_med_{idx}"):
                             st.session_state['medications_list'].pop(idx)
@@ -3210,7 +3369,8 @@ def render_explainability_tab():
         st.subheader("Global Feature Importance")
         try:
             # Load feature importance
-            feature_names = pd.read_csv("models/feature_template.csv").columns
+            template_path = get_data_path("feature_template.csv")
+            feature_names = pd.read_csv(template_path).columns
             # Correct way to get importance from Booster
             importance_map = model.get_score(importance_type='gain')
             feature_importance = [importance_map.get(f, 0) for f in feature_names]
@@ -3240,9 +3400,34 @@ def render_explainability_tab():
         st.subheader("Patient-Specific SHAP Analysis")
         try:
             # Prepare features (same as in prediction)
-            X_template = pd.read_csv("models/feature_template.csv").iloc[0:1].copy()
+            # Prepare features (same as in prediction)
+            # Robust path finding
+            template_path = get_data_path("feature_template.csv")
+            try:
+                template_df = pd.read_csv(template_path)
+                # Get column names from the template
+                column_names = template_df.columns.tolist()
+                
+                # If the template has data rows, use the first one
+                if len(template_df) > 0 and not template_df.iloc[0:1].isna().all().all():
+                    X_template = template_df.iloc[0:1].copy()
+                else:
+                    # Create a new DataFrame with one row of zeros based on column names
+                    X_template = pd.DataFrame({col: [0] for col in column_names})
+                
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Feature template not found at {template_path}")
+
+            if X_template.empty or len(X_template) == 0:
+                # Fallback: create template from column names if available
+                if 'column_names' in locals() and column_names:
+                    X_template = pd.DataFrame({col: [0] for col in column_names})
+                else:
+                    raise ValueError("Feature template is empty and cannot be reconstructed")
+            
+            # Ensure all columns are numeric and set to 0 initially
             for col in X_template.columns:
-                X_template[col] = 0
+                X_template[col] = pd.to_numeric(X_template[col], errors='coerce').fillna(0)
             
             feature_mapping = {
                 'gender': 1 if patient_data.get('gender') == 'M' else 0,
@@ -3365,14 +3550,22 @@ def render_explainability_tab():
                 st.warning(f"Could not compute SHAP values: {e}")
                 st.info("Showing model feature importance instead...")
                 
-                feature_importance = model.feature_importances_
-                feature_names = X_template.columns
-                
-                importance_df = pd.DataFrame({
-                    'Feature': [f.replace('_', ' ').title() for f in feature_names],
-                    'Importance': feature_importance
-                }).sort_values('Importance', ascending=False).head(10)
-                
+                if hasattr(model, 'feature_importances_'):
+                    feature_importance = model.feature_importances_
+                    feature_names = X_template.columns
+                    
+                    importance_df = pd.DataFrame({
+                        'Feature': [f.replace('_', ' ').title() for f in feature_names],
+                        'Importance': feature_importance
+                    }).sort_values('Importance', ascending=False).head(10)
+                else:
+                    # Fallback for Booster object
+                    score = model.get_score(importance_type='gain')
+                    importance_df = pd.DataFrame({
+                        'Feature': [k.replace('_', ' ').title() for k in score.keys()],
+                        'Importance': list(score.values())
+                    }).sort_values('Importance', ascending=False).head(10)
+
                 st.dataframe(importance_df, hide_index=True)
                 
         except Exception as e:
@@ -3561,8 +3754,30 @@ def main():
     # 3. Routing Logic
     if current_page == "dashboard":
         # === DASHBOARD MODE ===
-        # Ensure sidebar is visible
-        st.markdown("""<style>[data-testid="stSidebar"] {display: block !important;}</style>""", unsafe_allow_html=True)
+        # Ensure sidebar styling is correct and toggle button is always accessible
+        st.markdown("""
+            <style>
+                [data-testid="stSidebar"] {
+                    background-color: #F8FAFC !important;
+                }
+                [data-testid="stSidebar"] .block-container {
+                    color: #1F2937 !important;
+                }
+                [data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label, [data-testid="stSidebar"] div {
+                    color: #1F2937 !important;
+                }
+                /* Ensure Streamlit's built-in sidebar toggle button is always visible */
+                [data-testid="stHeader"] button[aria-label*="sidebar"],
+                [data-testid="stHeader"] button[aria-label*="menu"],
+                button[data-testid="baseButton-header"][aria-label*="sidebar"],
+                button[data-testid="baseButton-header"][aria-label*="menu"] {
+                    display: block !important;
+                    visibility: visible !important;
+                    opacity: 1 !important;
+                    z-index: 999 !important;
+                }
+            </style>
+        """, unsafe_allow_html=True)
         
         user = st.session_state['user']
         
